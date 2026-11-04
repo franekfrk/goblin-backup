@@ -1,0 +1,39 @@
+# Install as /etc/goblin-backup/config.toml, root-owned, mode 600.
+repository = "/mnt/backup/Goblin-Backup-Encrypted"
+# Exact mount point and source expected BEFORE writing any backup data.
+destination_mount = "/mnt/backup"
+destination_source = "//192.0.2.10/backup"
+state_dir = "/var/lib/goblin-backup-public"
+password_file = "/etc/goblin-backup/repository.key"
+vm_name = "WindowsVM" # Empty string disables VM handling.
+vm_shutdown_timeout = 180
+minimum_files = 1000
+minimum_bytes = 1073741824
+
+# Each source must itself be a Btrfs subvolume. Snapshot container must reside
+# on the SAME Btrfs filesystem as its source. Names become restore directories.
+[[sources]]
+name = "system"
+path = "/"
+snapshot_parent = "/.goblin-backup-snapshots"
+exclude = ["proc", "sys", "dev", "run", "tmp", "mnt", "media", "var/lib/goblin-backup-public", "etc/goblin-backup"]
+
+[[sources]]
+name = "home"
+path = "/home"
+snapshot_parent = "/home/.goblin-backup-snapshots"
+exclude = []
+
+[[sources]]
+name = "dane"
+path = "/dane"
+snapshot_parent = "/dane/.goblin-backup-snapshots"
+exclude = ["Nextcloud"]
+
+# Ordinary file copies, taken after the Btrfs snapshots.
+[[extra_sources]]
+name = "boot"
+path = "/boot"
+[[extra_sources]]
+name = "efi"
+path = "/boot/efi"

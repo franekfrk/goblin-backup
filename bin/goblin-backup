@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+"""Encrypted file backups from read-only Btrfs snapshots, with optional libvirt VM."""
+import argparse
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import time
+import tomllib
+from datetime import datetime, timezone
+
+
+def run(*args, **kwargs):
+    return subprocess.run([str(x) for x in args], check=True, **kwargs)
+
+
+def output(*args):
+    return run(*args, capture_output=True, text=True).stdout.strip()
+
+
+def load_config(path):
+    c = tomllib.loads(Path(path).read_text())
+    for k in ("repository", "destination_mount", "state_dir", "password_file"):
+        if not Path(c[k]).is_absolute():
+            raise ValueError(f"{k} must be absolute")
+    repo, mount, state, key = (Path(c[k]).resolve() for k in
+                             ("repository", "destination_mount", "state_dir", "password_file"))
+    if repo == mount or not repo.is_relative_to(mount):
+        raise ValueError("Repository must be a subdirectory of destination_mount")
+    if key.is_relative_to(mount) or state.is_relative_to(mount):
+        raise ValueError("Password and state must be outside the destination")
+    names = {"recovery-info"}
+    for s in c.get("sources", []) + c.get("extra_sources", []):
+        if not re.fullmatch(r"[a-zA-Z0-9_-]+", s["name"]) or s["name"] in names:
+            raise ValueError("Source names must be unique simple directory names")
+        names.add(s["name"])
+        if not Path(s["path"]).is_absolute():
+            raise ValueError("Source paths must be absolute")
+        if "snapshot_parent" in s and not Path(s["snapshot_parent"]).is_absolute():
+            raise ValueError("snapshot_parent must be absolute")
+        for x in s.get("exclude", []):
+            if Path(x).is_absolute() or ".." in Path(x).parts:
+                raise ValueError("Source exclusions must be relative without '..'")
+    if not c.get("sources"):
+        raise ValueError("At least one Btrfs source is required")
+    return c
+
+
+def patterns(c, current):
+    result = ["**/.goblin-backup-snapshots"]
+    # Explicit full paths prevent accidentally excluding the staging ancestor.
+    protected = [c["state_dir"], str(Path(c["password_file"]).parent)]
+    protected += [s["snapshot_parent"] for s in c["sources"]]
+    for s in c["sources"]:
+        source = Path(s["path"])
+        for p in protected:
+            try:
+                rel = Path(p).relative_to(source)
+            except ValueError:
+                continue
+            if str(rel) != ".":
+                result.append(str(current / s["name"] / rel))
+        result.extend(str(current / s["name"] / x) for x in s.get("exclude", []))
+    return sorted(set(result))
+
+
+def write_state(path, **values):
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(values, indent=2) + "\n")
+    tmp.replace(path)
+
+
+def backup(c, config_path):
+    if os.geteuid() != 0:
+        raise PermissionError("Run backup as root (sudo)")
+    info = Path(config_path).stat()
+    if info.st_uid != 0 or stat.S_IMODE(info.st_mode) & 0o022:
+        raise PermissionError("Configuration must be root-owned and not group/world writable")
+    base = Path(c["state_dir"])
+    base.mkdir(parents=True, exist_ok=True)
+    lock = (base / "run.lock").open("a")
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    state = base / "status.json"
+    # Trigger automount, then verify source AND exact mountpoint. No fallback to local disk.
+    mount = Path(c["destination_mount"])
+    mount.stat()
+    target = output("findmnt", "-rn", "-T", mount, "-o", "TARGET")
+    sources = output("findmnt", "-rn", "-T", mount, "-o", "SOURCE").splitlines()
+    if Path(target.splitlines()[-1]).resolve() != mount.resolve() or c["destination_source"] not in sources:
+        raise RuntimeError("Backup destination is not mounted from the expected source")
+    for s in c["sources"]:
+        run("btrfs", "subvolume", "show", s["path"], stdout=subprocess.DEVNULL)
+    current = base / "current"
+    if current.exists():
+        raise RuntimeError("Staging exists from a previous run. Inspect and clean it first; see recovery docs")
+    key = Path(c["password_file"])
+    if not key.exists():
+        if (Path(c["repository"]) / "config").exists():
+            raise RuntimeError("Repository exists but its password file is missing")
+        key.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with key.open("xb") as f:
+            os.chmod(key, 0o600)
+            import secrets
+            f.write(secrets.token_urlsafe(48).encode() + b"\n")
+    if key.stat().st_uid != 0 or stat.S_IMODE(key.stat().st_mode) & 0o077:
+        raise PermissionError("Password file must be root-owned, mode 600")
+    env = os.environ.copy()
+    env.update(RESTIC_PASSWORD_FILE=str(key), RESTIC_REPOSITORY=c["repository"],
+               RESTIC_CACHE_DIR=str(base / "cache"), LC_ALL="C")
+    def restic(*args, **kwargs):
+        return run("restic", *args, env=env, **kwargs)
+    if not (Path(c["repository"]) / "config").exists():
+        restic("init")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    vm, restart, mounts, snaps = c.get("vm_name", ""), False, [], []
+    write_state(state, phase="preparing", started=stamp)
+    try:
+        if vm:
+            vmstate = output("virsh", "-c", "qemu:///system", "domstate", vm)
+            if vmstate == "running":
+                restart = True
+                run("virsh", "-c", "qemu:///system", "shutdown", vm)
+                deadline = time.monotonic() + c.get("vm_shutdown_timeout", 180)
+                while output("virsh", "-c", "qemu:///system", "domstate", vm) != "shut off":
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("VM did not shut down; no force-stop was attempted")
+                    time.sleep(2)
+            elif vmstate != "shut off":
+                raise RuntimeError("VM must be running or shut off; paused VMs are not handled")
+        current.mkdir()
+        os.sync()
+        for s in c["sources"]:
+            parent = Path(s["snapshot_parent"])
+            parent.mkdir(parents=True, exist_ok=True)
+            snap = parent / ("goblin-" + stamp + "-" + s["name"])
+            run("btrfs", "subvolume", "snapshot", "-r", s["path"], snap)
+            snaps.append(str(snap))
+            target = current / s["name"]
+            target.mkdir()
+            run("mount", "--bind", snap, target)
+            mounts.append(str(target))
+            run("mount", "-o", "remount,bind,ro", target)
+        (base / "staging.json").write_text(json.dumps(dict(mounts=mounts, snapshots=snaps), indent=2))
+        if restart:
+            run("virsh", "-c", "qemu:///system", "start", vm)
+            restart = False
+        for s in c.get("extra_sources", []):
+            target = current / s["name"]
+            target.mkdir()
+            run("cp", "-a", str(Path(s["path"])) + "/.", str(target) + "/")
+        meta = current / "recovery-info"
+        meta.mkdir()
+        for filename, cmd in [("lsblk.txt", ["lsblk", "-f"]), ("packages.txt", ["rpm", "-qa"])]:
+            (meta / filename).write_text(output(*cmd) + "\n")
+        if vm:
+            (meta / "vm.xml").write_text(output("virsh", "-c", "qemu:///system", "dumpxml", vm))
+        (meta / "restore-probe.txt").write_text("Goblin backup restore verification " + stamp + "\n")
+        excludes = base / "excludes.txt"
+        excludes.write_text("\n".join(patterns(c, current)) + "\n")
+        write_state(state, phase="backup", started=stamp)
+        paths = [current / s["name"] for s in c["sources"] + c.get("extra_sources", [])] + [meta]
+        with (base / "progress.jsonl").open("w") as progress:
+            restic("backup", "--json", "--one-file-system", "--tag", "goblin-backup", "--exclude-file", excludes,
+                   *paths, stdout=progress)
+        summaries = [json.loads(x) for x in (base / "progress.jsonl").read_text().splitlines()
+                     if x.strip() and json.loads(x).get("message_type") == "summary"]
+        summary = summaries[-1]
+        if summary["total_files_processed"] < c.get("minimum_files", 1000) or summary["total_bytes_processed"] < c.get("minimum_bytes", 1073741824):
+            raise RuntimeError("Backup size sanity check failed")
+        snapshot = summary["snapshot_id"]
+        write_state(state, phase="verifying", started=stamp, snapshot=snapshot)
+        restic("check", "--read-data")
+        restore = base / "restore-test" / stamp
+        restic("restore", snapshot, "--include", meta / "restore-probe.txt", "--target", restore)
+        recovered = restore / (str(meta / "restore-probe.txt").lstrip("/"))
+        if recovered.read_bytes() != (meta / "restore-probe.txt").read_bytes():
+            raise RuntimeError("Restore test failed")
+        for target in reversed(mounts):
+            run("umount", target)
+        mounts.clear()
+        for snap in reversed(snaps):
+            run("btrfs", "subvolume", "delete", snap)
+        snaps.clear()
+        shutil.rmtree(current)  # only staging owned by this run, after all mounts removed
+        write_state(state, phase="verified", started=stamp, snapshot=snapshot)
+        print("Backup verified:", snapshot)
+    except BaseException as exc:
+        write_state(state, phase="failed", started=stamp, error=str(exc))
+        raise
+    finally:
+        (base / "staging.json").write_text(json.dumps(dict(mounts=mounts, snapshots=snaps), indent=2))
+        if restart and output("virsh", "-c", "qemu:///system", "domstate", vm) == "shut off":
+            run("virsh", "-c", "qemu:///system", "start", vm)
+
+
+def main():
+    os.umask(0o077)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("command", choices=["check", "backup", "status"])
+    parser.add_argument("--config", default="/etc/goblin-backup/config.toml")
+    args = parser.parse_args()
+    c = load_config(args.config)
+    if args.command == "check":
+        for tool in ("restic", "btrfs", "findmnt", "mount", "umount", "cp", "rpm", "lsblk") + (("virsh",) if c.get("vm_name") else ()):
+            if not shutil.which(tool):
+                raise RuntimeError(f"Missing dependency: {tool}")
+        print("Configuration and dependencies OK. No backup was started; mount/source/permissions are checked on backup.")
+    elif args.command == "status":
+        base = Path(c["state_dir"])
+        d = json.loads((base / "status.json").read_text())
+        print(json.dumps(d, indent=2))
+        if d["phase"] == "backup" and (base / "progress.jsonl").exists():
+            for line in reversed((base / "progress.jsonl").read_text().splitlines()):
+                try:
+                    p = json.loads(line)
+                except ValueError:
+                    continue
+                if p.get("message_type") == "status":
+                    print(f"{p.get('percent_done', 0)*100:.1f}% — {p.get('bytes_done', 0)/2**30:.2f} GiB read")
+                    break
+        print("A stored phase is not proof the process is still running; check systemctl status goblin-backup.")
+    else:
+        backup(c, args.config)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (Exception, KeyboardInterrupt) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
