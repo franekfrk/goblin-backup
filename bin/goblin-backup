@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -34,6 +35,9 @@ def load_config(path):
         raise ValueError("Repository must be a subdirectory of destination_mount")
     if key.is_relative_to(mount) or state.is_relative_to(mount):
         raise ValueError("Password and state must be outside the destination")
+    keep = c.get("keep_last", 0)
+    if type(keep) is not int or keep < 0:
+        raise ValueError("keep_last must be a nonnegative integer (0 disables pruning)")
     names = {"recovery-info"}
     for s in c.get("sources", []) + c.get("extra_sources", []):
         if not re.fullmatch(r"[a-zA-Z0-9_-]+", s["name"]) or s["name"] in names:
@@ -187,6 +191,11 @@ def backup(c, config_path):
             run("btrfs", "subvolume", "delete", snap)
         snaps.clear()
         shutil.rmtree(current)  # only staging owned by this run, after all mounts removed
+        if c.get("keep_last", 0):
+            write_state(state, phase="pruning", started=stamp, snapshot=snapshot)
+            # One retention group per host, including predecessor snapshots with different paths.
+            restic("forget", "--host", socket.gethostname(), "--group-by", "host",
+                   "--keep-last", str(c["keep_last"]), "--prune")
         write_state(state, phase="verified", started=stamp, snapshot=snapshot)
         print("Backup verified:", snapshot)
     except BaseException as exc:

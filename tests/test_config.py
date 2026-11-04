@@ -26,6 +26,10 @@ class ConfigTests(unittest.TestCase):
         self.assertNotIn(c['state_dir'],patterns)
         self.assertNotIn('**/var/lib/goblin-backup-public',patterns)
 
+    def test_rejects_invalid_retention(self):
+        with self.assertRaises(ValueError):
+            self.config((ROOT/'examples/config.toml').read_text().replace('keep_last = 4', 'keep_last = -1'))
+
     def test_rejects_traversal(self):
         with self.assertRaises(ValueError):
             self.config((ROOT/'examples/config.toml').read_text().replace('exclude = ["Nextcloud"]','exclude = ["../secrets"]'))

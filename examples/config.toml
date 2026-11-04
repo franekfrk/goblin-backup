@@ -7,6 +7,7 @@ state_dir = "/var/lib/goblin-backup-public"
 password_file = "/etc/goblin-backup/repository.key"
 vm_name = "WindowsVM" # Empty string disables VM handling.
 vm_shutdown_timeout = 180
+keep_last = 4 # Per host, after successful data verification and restore test. 0 disables.
 minimum_files = 1000
 minimum_bytes = 1073741824
 

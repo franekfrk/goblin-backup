@@ -16,6 +16,7 @@ This configurable rewrite has configuration/exclusion tests and a temporary rest
 6. Encrypts, deduplicates and compresses data through restic.
 7. Reads repository data back and restores a small probe file.
 8. Removes this run's snapshots only after successful verification.
+9. With `keep_last = 4`, keeps the last four snapshots for this hostname and prunes unreferenced data, only after successful verification. This includes predecessor snapshots with different paths/tags: use a dedicated repository per machine. Set `keep_last = 0` to disable deletion.
 
 This is a **file backup, not a bootable disk image**. The restore probe does not prove that an entire OS or VM can boot after restoration. Boot/EFI copies are taken live; snapshots are taken sequentially, not atomically across disks. Applications other than the configured VM are captured in a crash-consistent state, not necessarily application-consistent state.
 
