@@ -65,6 +65,10 @@ Store an independent copy in your password manager or a separate protected USB d
 
 The destination can be read by a server administrator, but restic content is encrypted. The server can still delete the repository; encryption does not prevent deletion. RAID mirror does not replace a backup.
 
+## Desktop notifications
+
+Optional silent KDE notifications report success, errors or cancellation and queue the latest result until next login. See [contrib/NOTIFICATIONS.md](contrib/NOTIFICATIONS.md).
+
 ## Restore
 
 See [docs/RESTORE.md](docs/RESTORE.md) for listing snapshots, restoring files/VM and rebuilding a workstation. Restore into a separate empty directory first. Restoring a system requires Fedora rescue media and knowledge of LUKS/Btrfs/bootloader recovery.
